@@ -451,7 +451,12 @@ fn populate_schema_from_empty_relation(
     // where temp tables are session-scoped. Sidecar/service adapter calls route
     // DDL through an Execute task, which cannot handle Snowflake-qualified temp
     // tables, so sidecar inference uses the query-schema path as well.
-    let materialization = if ctx.adapter_type() == AdapterType::DuckDB || infer_with_query_schema {
+    // ClickHouse: the probe's session-scoped TEMPORARY table is invisible to
+    // introspection (never in system.columns), so infer via the query schema.
+    let materialization = if ctx.adapter_type() == AdapterType::DuckDB
+        || ctx.adapter_type() == AdapterType::ClickHouse
+        || infer_with_query_schema
+    {
         r#"
   {% macro get_expected_columns(sql, select_sql_header) -%}
       {%- if select_sql_header is not none -%}
@@ -921,6 +926,11 @@ fn discover_given_relations(
     let given_capture = UnitTestGivenCapture::new();
     listeners.push(Rc::clone(&given_capture) as Rc<dyn RenderingEventListener>);
 
+    // ClickHouse runs with static analysis off and the persisted schema cache
+    // has no TTL, so a cached schema goes stale when an upstream model is
+    // rebuilt with different column types between invocations.
+    let force_refetch = ctx.adapter_type() == AdapterType::ClickHouse;
+
     for given in &ut.__unit_test_attr__.given {
         let given_relation = {
             ctx.env
@@ -940,7 +950,7 @@ fn discover_given_relations(
         // Only check/fetch schemas for Dict and Csv formats.
         if given.format != schemas::common::Formats::Sql {
             let canonical_fqn = relation.get_canonical_fqn()?;
-            if !ctx.schema_cache.exists(&canonical_fqn) {
+            if force_refetch || !ctx.schema_cache.exists(&canonical_fqn) {
                 relations_to_fetch
                     .push((Arc::clone(&relation), UnitTestSchemaTarget::GivenUpstream));
             }
@@ -976,7 +986,7 @@ fn discover_given_relations(
             let schema_relation = check_defer_relation(&model_unique_id, ctx)
                 .unwrap_or_else(|| expect_relation.clone());
             let canonical_fqn = schema_relation.get_canonical_fqn()?;
-            if !ctx.schema_cache.exists(&canonical_fqn) {
+            if force_refetch || !ctx.schema_cache.exists(&canonical_fqn) {
                 relations_to_fetch.push((
                     schema_relation,
                     UnitTestSchemaTarget::ExpectedModel {
